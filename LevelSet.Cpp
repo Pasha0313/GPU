@@ -7,7 +7,7 @@
 #define NZ 128          // Grid size in Z
 #define BLOCK_SIZE 8    // CUDA block size
 #define DX 0.01f        // Grid spacing
-#define DT 0.0001f      // Time step
+#define CFL 0.5f        // CFL number
 #define STEPS 1000      // Number of time steps
 
 // CUDA error checking macro
@@ -46,8 +46,28 @@ __device__ float weno_derivative(float v1, float v2, float v3, float v4, float v
     return flux / DX;
 }
 
-// Level set evolution kernel
-__global__ void level_set_kernel(float* phi, float* phi_new) {
+// Reinitialization step to maintain signed distance property
+__global__ void reinitialize_level_set(float* phi, float* phi_new) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i >= 1 && i < NX-1 && j >= 1 && j < NY-1 && k >= 1 && k < NZ-1) {
+        int idx = (k * NY + j) * NX + i;
+
+        float dphi_dx = (phi[idx+1] - phi[idx-1]) / (2.0f * DX);
+        float dphi_dy = (phi[idx+NX] - phi[idx-NX]) / (2.0f * DX);
+        float dphi_dz = (phi[idx+NX*NY] - phi[idx-NX*NY]) / (2.0f * DX);
+
+        float grad_phi = sqrtf(dphi_dx * dphi_dx + dphi_dy * dphi_dy + dphi_dz * dphi_dz);
+        float sign_phi = phi[idx] / sqrtf(phi[idx] * phi[idx] + DX * DX);
+
+        phi_new[idx] = phi[idx] - DX * (grad_phi - 1.0f) * sign_phi;
+    }
+}
+
+// Level set evolution kernel with adaptive time-stepping and velocity field
+__global__ void level_set_kernel(float* phi, float* phi_new, float* u, float* v, float* w, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
@@ -55,24 +75,22 @@ __global__ void level_set_kernel(float* phi, float* phi_new) {
     if (i >= 2 && i < NX-2 && j >= 2 && j < NY-2 && k >= 2 && k < NZ-2) {
         int idx = (k * NY + j) * NX + i;
 
-        // WENO derivatives in x, y, z directions
         float dphi_dx = weno_derivative(phi[idx-2], phi[idx-1], phi[idx], phi[idx+1], phi[idx+2]);
         float dphi_dy = weno_derivative(phi[idx-2*NX], phi[idx-NX], phi[idx], phi[idx+NX], phi[idx+2*NX]);
         float dphi_dz = weno_derivative(phi[idx-2*NX*NY], phi[idx-NX*NY], phi[idx], phi[idx+NX*NY], phi[idx+2*NX*NY]);
 
-        // Upwind scheme (assuming velocity field = (1, 1, 1))
-        float velocity = 1.0f;
-        phi_new[idx] = phi[idx] - DT * velocity * (dphi_dx + dphi_dy + dphi_dz);
+        phi_new[idx] = phi[idx] - dt * (u[idx] * dphi_dx + v[idx] * dphi_dy + w[idx] * dphi_dz);
     }
 }
 
 int main() {
     size_t size = NX * NY * NZ * sizeof(float);
 
-    // Host memory allocation
     float* h_phi = (float*)malloc(size);
+    float* h_u = (float*)malloc(size);
+    float* h_v = (float*)malloc(size);
+    float* h_w = (float*)malloc(size);
 
-    // Initial condition: Sphere level set
     for (int k = 0; k < NZ; k++) {
         for (int j = 0; j < NY; j++) {
             for (int i = 0; i < NX; i++) {
@@ -80,37 +98,42 @@ int main() {
                 float x = (i - NX / 2) * DX;
                 float y = (j - NY / 2) * DX;
                 float z = (k - NZ / 2) * DX;
-                h_phi[idx] = sqrtf(x*x + y*y + z*z) - 0.2f; // Sphere of radius 0.2
+                h_phi[idx] = sqrtf(x*x + y*y + z*z) - 0.2f;
+                h_u[idx] = 1.0f; // Sample velocity field
+                h_v[idx] = 0.5f;
+                h_w[idx] = 0.2f;
             }
         }
     }
 
-    // Device memory allocation
-    float *d_phi, *d_phi_new;
+    float *d_phi, *d_phi_new, *d_u, *d_v, *d_w;
     checkCuda(cudaMalloc((void**)&d_phi, size));
     checkCuda(cudaMalloc((void**)&d_phi_new, size));
+    checkCuda(cudaMalloc((void**)&d_u, size));
+    checkCuda(cudaMalloc((void**)&d_v, size));
+    checkCuda(cudaMalloc((void**)&d_w, size));
 
-    // Copy initial condition to device
     checkCuda(cudaMemcpy(d_phi, h_phi, size, cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_u, h_u, size, cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_v, h_v, size, cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_w, h_w, size, cudaMemcpyHostToDevice));
 
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
     dim3 numBlocks((NX + BLOCK_SIZE - 1) / BLOCK_SIZE, (NY + BLOCK_SIZE - 1) / BLOCK_SIZE, (NZ + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    // Time-stepping loop
     for (int step = 0; step < STEPS; step++) {
-        level_set_kernel<<<numBlocks, threadsPerBlock>>>(d_phi, d_phi_new);
+        float max_velocity = 1.0f; // For CFL calculation
+        float dt = CFL * DX / max_velocity;
+
+        level_set_kernel<<<numBlocks, threadsPerBlock>>>(d_phi, d_phi_new, d_u, d_v, d_w, dt);
         checkCuda(cudaGetLastError());
 
-        // Swap pointers
-        float* temp = d_phi;
-        d_phi = d_phi_new;
-        d_phi_new = temp;
+        reinitialize_level_set<<<numBlocks, threadsPerBlock>>>(d_phi_new, d_phi);
+        checkCuda(cudaGetLastError());
     }
 
-    // Copy final result back to host
     checkCuda(cudaMemcpy(h_phi, d_phi, size, cudaMemcpyDeviceToHost));
 
-    // Output a section of the level set field
     for (int k = NZ / 2 - 2; k <= NZ / 2 + 2; k++) {
         for (int j = NY / 2 - 2; j <= NY / 2 + 2; j++) {
             for (int i = NX / 2 - 2; i <= NX / 2 + 2; i++) {
@@ -122,10 +145,15 @@ int main() {
         printf("\n");
     }
 
-    // Free memory
     cudaFree(d_phi);
     cudaFree(d_phi_new);
+    cudaFree(d_u);
+    cudaFree(d_v);
+    cudaFree(d_w);
     free(h_phi);
+    free(h_u);
+    free(h_v);
+    free(h_w);
 
     return 0;
 }
